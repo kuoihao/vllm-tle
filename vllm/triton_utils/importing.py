@@ -16,6 +16,22 @@ HAS_TRITON = (
     find_spec("triton") is not None
     or find_spec("pytorch-triton-xpu") is not None  # Not compatible
 )
+HAS_TLE = find_spec("triton.experimental.tle.language") is not None
+
+
+def _has_active_tle_driver() -> bool:
+    """Accept FlagTree's runtime driver when its compatibility shim is absent."""
+    if not HAS_TLE:
+        return False
+    try:
+        import torch
+        from triton.runtime import driver
+
+        return torch.cuda.is_available() and driver.active is not None
+    except Exception:
+        return False
+
+
 if HAS_TRITON:
     try:
         from triton.backends import backends
@@ -68,13 +84,20 @@ if HAS_TRITON:
                 )
                 HAS_TRITON = False
     except ImportError:
-        # This can occur if Triton is partially installed or triton.backends
-        # is missing.
-        logger.warning(
-            "Triton is installed, but `triton.backends` could not be imported. "
-            "Disabling Triton."
-        )
-        HAS_TRITON = False
+        # FlagTree 0.6.0 intentionally exposes the TLE runtime without the
+        # upstream `triton.backends` registry. Its runtime driver is still
+        # usable for both the plain Triton and TLE paths.
+        if _has_active_tle_driver():
+            logger.info(
+                "FlagTree TLE runtime detected without `triton.backends`; "
+                "keeping Triton kernels enabled."
+            )
+        else:
+            logger.warning(
+                "Triton is installed, but `triton.backends` could not be imported. "
+                "Disabling Triton."
+            )
+            HAS_TRITON = False
     except Exception as e:
         # Catch any other unexpected errors during the check.
         logger.warning(

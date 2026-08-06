@@ -18,7 +18,9 @@ from vllm.model_executor.layers.mamba.ops.gather_initial_states import (
 from vllm.models.kimi_k3.nvidia.kda import (
     is_flashkda_supported,
     is_fused_kda_decode_supported,
+    is_tle_kda_supported,
 )
+from vllm.models.kimi_k3.nvidia.ops.tle_kda import tle_kda_prefill
 from vllm.models.kimi_k3.nvidia.ops.third_party.kda import (
     chunk_kda,
     chunk_kda_with_fused_gate,
@@ -751,6 +753,68 @@ def test_flashkda_correctness():
         initial_state,
         actual_state,
         cu_seqlens,
+    )
+
+    assert_close("o", expected_out, actual_out, 0.01)
+    assert_close("ht", expected_state, actual_state, 0.01)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@torch.inference_mode()
+def test_tle_kda_correctness():
+    if not is_tle_kda_supported(128, torch.bfloat16, -3.0):
+        pytest.skip("FlagTree TLE KDA is not supported on this GPU")
+
+    B, T, H, D = 1, 48, 2, 128
+    torch.manual_seed(12)
+    q, k, v, raw_g = [
+        torch.randn(B, T, H, D, dtype=torch.bfloat16, device=DEVICE)
+        for _ in range(4)
+    ]
+    beta_logits = torch.randn(B, T, H, dtype=torch.bfloat16, device=DEVICE)
+    A_log = torch.randn(H, dtype=torch.float32, device=DEVICE) * 0.5
+    dt_bias = torch.randn(H, D, dtype=torch.float32, device=DEVICE) * 0.1
+    initial_state = torch.randn(2, H, D, D, dtype=torch.float32, device=DEVICE)
+    cu_seqlens = torch.tensor([0, 17, T], dtype=torch.int32, device=DEVICE)
+    lower_bound = -3.0
+
+    beta = beta_logits.float().sigmoid()
+    q_norm = l2norm_fwd(q.contiguous())
+    k_norm = l2norm_fwd(k.contiguous())
+    expected_outputs = []
+    expected_states = []
+    for i, (start, end) in enumerate(
+        zip(cu_seqlens[:-1].tolist(), cu_seqlens[1:].tolist())
+    ):
+        gate = lower_bound * torch.sigmoid(
+            A_log.exp()[None, None, :, None]
+            * (raw_g[:, start:end].float() + dt_bias[None, None, :, :])
+        )
+        expected_output, expected_final_state = naive_recurrent_kda(
+            q_norm[:, start:end],
+            k_norm[:, start:end],
+            v[:, start:end],
+            gate,
+            beta[:, start:end],
+            initial_state=initial_state[i].transpose(-1, -2),
+            output_final_state=True,
+        )
+        expected_outputs.append(expected_output)
+        expected_states.append(expected_final_state)
+
+    expected_out = torch.cat(expected_outputs, dim=1)
+    expected_state = torch.cat(expected_states).transpose(-1, -2).contiguous()
+    actual_out, actual_state = tle_kda_prefill(
+        q=q,
+        k=k,
+        v=v,
+        g=raw_g,
+        beta=beta_logits,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        lower_bound=lower_bound,
+        initial_state=initial_state,
+        cu_seqlens=cu_seqlens,
     )
 
     assert_close("o", expected_out, actual_out, 0.01)

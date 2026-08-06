@@ -42,6 +42,10 @@ from vllm.models.kimi_k3.nvidia.kda_metadata import (
     KimiK3KDAAttentionBackend,
     KimiK3KDAMetadata,
 )
+from vllm.models.kimi_k3.nvidia.ops.tle_kda import (
+    is_tle_kda_supported,
+    tle_kda_prefill,
+)
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
@@ -230,8 +234,16 @@ def resolve_kda_prefill_backend(
     dtype: torch.dtype,
     lower_bound: float | None,
 ) -> str:
-    if backend not in ("auto", "triton", "flashkda"):
+    if backend not in ("auto", "triton", "flashkda", "tle"):
         raise ValueError(f"Unsupported KDA prefill backend: {backend}")
+    if backend == "tle":
+        if not is_tle_kda_supported(head_dim, dtype, lower_bound):
+            raise RuntimeError(
+                "KDA TLE requires CUDA SM90, bfloat16, head_dim=128, "
+                "and a bounded gate in [-5, 0)."
+            )
+        logger.info_once("Using FlagTree TLE KDA prefill backend.")
+        return "tle"
     supported = is_flashkda_supported(head_dim, dtype, lower_bound)
     if backend == "flashkda" and not supported:
         raise RuntimeError(
@@ -700,6 +712,23 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                         core_attn_out_non_spec,
                         last_recurrent_state,
                     ) = _flashkda_prefill(
+                        q=q_ns,
+                        k=k_ns,
+                        v=v_ns,
+                        g=g1_ns,
+                        beta=beta_ns,
+                        A_log=self.A_log,
+                        dt_bias=self.dt_bias,
+                        lower_bound=self.gate_lower_bound,
+                        initial_state=initial_state,
+                        cu_seqlens=non_spec_query_start_loc,
+                    )
+                elif self.kda_prefill_backend == "tle":
+                    assert self.gate_lower_bound is not None
+                    (
+                        core_attn_out_non_spec,
+                        last_recurrent_state,
+                    ) = tle_kda_prefill(
                         q=q_ns,
                         k=k_ns,
                         v=v_ns,
